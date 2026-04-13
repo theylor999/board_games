@@ -28,7 +28,6 @@ export default function VelhaGame() {
   const router = useRouter();
   const role = searchParams.get("role") as "host" | "guest";
 
-  // Name entry state
   const [myName, setMyName] = useState(searchParams.get("name") || "");
   const [nameConfirmed, setNameConfirmed] = useState(!!searchParams.get("name"));
   const [nameInput, setNameInput] = useState("");
@@ -43,8 +42,12 @@ export default function VelhaGame() {
   const [winLine, setWinLine] = useState<number[] | null>(null);
   const [scores, setScores] = useState({ me: 0, opp: 0 });
   const channelRef = useRef<RealtimeChannel | null>(null);
+
+  // refs to avoid stale closures in intervals
   const statusRef = useRef(status);
   statusRef.current = status;
+  const myNameRef = useRef(myName);
+  myNameRef.current = myName;
 
   const shareUrl = typeof window !== "undefined"
     ? `${window.location.origin}/velha/${roomId}?role=guest`
@@ -58,23 +61,28 @@ export default function VelhaGame() {
     if (!nameConfirmed) return;
 
     const channel = supabase.channel(`velha:${roomId}`, {
-      config: {
-        broadcast: { self: false },
-        presence: { key: role },
-      },
+      config: { broadcast: { self: false } },
     });
     channelRef.current = channel;
 
-    // Presence: detect when opponent joins
-    channel.on("presence", { event: "sync" }, () => {
-      const state = channel.presenceState<{ name: string; role: string }>();
-      const users = Object.values(state).flat();
-      const opponent = users.find(u => u.role !== role);
-      if (opponent) {
-        setOpponentName(opponent.name);
+    // Heartbeat interval: keep announcing presence every 2s until opponent found
+    let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+
+    function sendHello() {
+      channel.send({
+        type: "broadcast",
+        event: "hello",
+        payload: { name: myNameRef.current, role },
+      });
+    }
+
+    channel
+      // When opponent announces themselves
+      .on("broadcast", { event: "hello" }, ({ payload }) => {
+        if (payload.role === role) return; // same role, ignore
+        setOpponentName(payload.name);
         if (statusRef.current === "waiting") {
           setStatus("playing");
-          // Host resets board for fresh game
           if (role === "host") {
             setBoard(Array(9).fill(null));
             setCurrentTurn("X");
@@ -82,11 +90,9 @@ export default function VelhaGame() {
             setWinLine(null);
           }
         }
-      }
-    });
-
-    // Game move event
-    channel
+        // Reply so the other side knows about us too
+        sendHello();
+      })
       .on("broadcast", { event: "move" }, ({ payload }) => {
         const newBoard = [...payload.board] as Board;
         setBoard(newBoard);
@@ -96,10 +102,7 @@ export default function VelhaGame() {
           setWinLine(w.line);
           setResult(`${payload.moverName} venceu!`);
           setStatus("finished");
-          setScores(s => ({
-            me: s.me,
-            opp: s.opp + 1,
-          }));
+          setScores(s => ({ me: s.me, opp: s.opp + 1 }));
         } else if (newBoard.every(Boolean)) {
           setResult("Empate! 🤝");
           setStatus("finished");
@@ -113,12 +116,23 @@ export default function VelhaGame() {
         setWinLine(null);
         if (payload.scores) setScores(payload.scores);
       })
-      .subscribe(async () => {
-        await channel.track({ name: myName, role });
+      .subscribe(() => {
+        // Start broadcasting hello every 2s
+        sendHello();
+        heartbeatInterval = setInterval(() => {
+          if (statusRef.current === "waiting") {
+            sendHello();
+          } else {
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
+          }
+        }, 2000);
       });
 
-    return () => { supabase.removeChannel(channel); };
-  }, [roomId, role, myName, nameConfirmed]);
+    return () => {
+      if (heartbeatInterval) clearInterval(heartbeatInterval);
+      supabase.removeChannel(channel);
+    };
+  }, [roomId, role, nameConfirmed]);
 
   function handleClick(i: number) {
     if (status !== "playing" || board[i] || currentTurn !== mySymbol) return;
@@ -153,7 +167,6 @@ export default function VelhaGame() {
 
   const isMyTurn = currentTurn === mySymbol && status === "playing";
 
-  // Name entry screen
   if (!nameConfirmed) {
     return (
       <main className="min-h-screen flex flex-col items-center justify-center p-6" style={{ background: '#0f172a' }}>
@@ -166,13 +179,23 @@ export default function VelhaGame() {
             placeholder="Seu nome..."
             value={nameInput}
             onChange={e => setNameInput(e.target.value)}
-            onKeyDown={e => { if (e.key === "Enter" && nameInput.trim()) { setMyName(nameInput.trim()); setNameConfirmed(true); } }}
+            onKeyDown={e => {
+              if (e.key === "Enter" && nameInput.trim()) {
+                setMyName(nameInput.trim());
+                setNameConfirmed(true);
+              }
+            }}
             className="w-full px-4 py-3 rounded-xl text-center text-lg font-semibold outline-none border-2 mb-4"
             style={{ background: '#1e293b', color: '#f1f5f9', borderColor: '#334155' }}
             autoFocus
           />
           <button
-            onClick={() => { if (nameInput.trim()) { setMyName(nameInput.trim()); setNameConfirmed(true); } }}
+            onClick={() => {
+              if (nameInput.trim()) {
+                setMyName(nameInput.trim());
+                setNameConfirmed(true);
+              }
+            }}
             disabled={!nameInput.trim()}
             className="w-full py-3 rounded-xl font-bold disabled:opacity-40"
             style={{ background: '#4f46e5', color: 'white' }}
@@ -187,7 +210,6 @@ export default function VelhaGame() {
   return (
     <main className="min-h-screen flex flex-col items-center justify-center p-4" style={{ background: '#0f172a' }}>
       <div className="w-full max-w-sm">
-        {/* Header */}
         <div className="text-center mb-6">
           <h1 className="text-3xl font-bold mb-1" style={{ color: '#f1f5f9' }}>❌ Jogo da Velha</h1>
           <div className="text-sm font-mono px-3 py-1 rounded-lg inline-block" style={{ background: '#1e293b', color: '#94a3b8' }}>
@@ -195,7 +217,6 @@ export default function VelhaGame() {
           </div>
         </div>
 
-        {/* Scores */}
         <div className="flex justify-between mb-4 rounded-xl p-3" style={{ background: '#1e293b' }}>
           <div className="text-center">
             <div className="text-2xl font-bold" style={{ color: mySymbol === "X" ? '#ef4444' : '#3b82f6' }}>{mySymbol}</div>
@@ -210,10 +231,9 @@ export default function VelhaGame() {
           </div>
         </div>
 
-        {/* Status */}
         {status === "waiting" && (
           <div className="text-center mb-4 p-4 rounded-xl" style={{ background: '#1e293b' }}>
-            <p className="mb-3" style={{ color: '#94a3b8' }}>Aguardando jogador...</p>
+            <p className="mb-3" style={{ color: '#94a3b8' }}>⏳ Aguardando jogador...</p>
             <p className="text-xs mb-2" style={{ color: '#64748b' }}>Mande o link para seu amigo:</p>
             <div className="text-xs font-mono p-2 rounded-lg break-all" style={{ background: '#0f172a', color: '#6366f1' }}>
               {shareUrl}
@@ -232,14 +252,13 @@ export default function VelhaGame() {
           <div className="text-center mb-4">
             <span className="px-4 py-2 rounded-lg font-semibold" style={{
               background: isMyTurn ? '#14532d' : '#1e293b',
-              color: isMyTurn ? '#4ade80' : '#94a3b8'
+              color: isMyTurn ? '#4ade80' : '#94a3b8',
             }}>
               {isMyTurn ? "Sua vez!" : `Vez de ${opponentName || "..."}`}
             </span>
           </div>
         )}
 
-        {/* Board */}
         <div className="grid grid-cols-3 gap-3 mb-6">
           {board.map((cell, i) => {
             const isWin = winLine?.includes(i);
@@ -262,7 +281,6 @@ export default function VelhaGame() {
           })}
         </div>
 
-        {/* Result */}
         {status === "finished" && result && (
           <div className="text-center mb-4 p-4 rounded-xl" style={{ background: '#1e293b' }}>
             <p className="text-2xl font-bold mb-3" style={{ color: '#f1f5f9' }}>{result}</p>

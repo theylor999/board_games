@@ -26,7 +26,6 @@ export default function DominoGame() {
   const router = useRouter();
   const role = searchParams.get("role") as "host" | "guest";
 
-  // Name entry state
   const [myName, setMyName] = useState(searchParams.get("name") || "");
   const [nameConfirmed, setNameConfirmed] = useState(!!searchParams.get("name"));
   const [nameInput, setNameInput] = useState("");
@@ -42,10 +41,13 @@ export default function DominoGame() {
   const [selected, setSelected] = useState<number | null>(null);
   const [message, setMessage] = useState<string>("");
   const channelRef = useRef<RealtimeChannel | null>(null);
+
   const statusRef = useRef(status);
   statusRef.current = status;
   const gsRef = useRef(gs);
   gsRef.current = gs;
+  const myNameRef = useRef(myName);
+  myNameRef.current = myName;
 
   const shareUrl = typeof window !== "undefined"
     ? `${window.location.origin}/domino/${roomId}?role=guest`
@@ -55,7 +57,6 @@ export default function DominoGame() {
     channelRef.current?.send({ type: "broadcast", event, payload });
   }, []);
 
-  // Host starts the game — only called once when guest presence detected
   const startGame = useCallback((existingScores?: { host: number; guest: number }) => {
     const deck = createDeck();
     const { hand1, hand2, pile } = dealHands(deck);
@@ -80,12 +81,7 @@ export default function DominoGame() {
     channelRef.current?.send({
       type: "broadcast",
       event: "game_start",
-      payload: {
-        guestHand: hand2,
-        hostHandCount: hand1.length,
-        pile,
-        scores,
-      },
+      payload: { guestHand: hand2, hostHandCount: hand1.length, pile, scores },
     });
   }, []);
 
@@ -93,29 +89,34 @@ export default function DominoGame() {
     if (!nameConfirmed) return;
 
     const channel = supabase.channel(`domino:${roomId}`, {
-      config: {
-        broadcast: { self: false },
-        presence: { key: role },
-      },
+      config: { broadcast: { self: false } },
     });
     channelRef.current = channel;
 
-    // Presence: detect when opponent joins
-    channel.on("presence", { event: "sync" }, () => {
-      const state = channel.presenceState<{ name: string; role: string }>();
-      const users = Object.values(state).flat();
-      const opponent = users.find(u => u.role !== role);
-      if (opponent) {
-        setOpponentName(opponent.name);
-        if (statusRef.current === "waiting" && role === "host") {
-          startGame();
-        } else if (statusRef.current === "waiting" && role === "guest") {
-          setStatus("playing");
-        }
-      }
-    });
+    let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+
+    function sendHello() {
+      channel.send({
+        type: "broadcast",
+        event: "hello",
+        payload: { name: myNameRef.current, role },
+      });
+    }
 
     channel
+      .on("broadcast", { event: "hello" }, ({ payload }) => {
+        if (payload.role === role) return;
+        setOpponentName(payload.name);
+        if (statusRef.current === "waiting") {
+          if (role === "host") {
+            startGame();
+          } else {
+            setStatus("playing");
+          }
+        }
+        // Always reply so both sides know each other
+        sendHello();
+      })
       .on("broadcast", { event: "game_start" }, ({ payload }) => {
         setGs(prev => ({
           ...prev,
@@ -144,7 +145,7 @@ export default function DominoGame() {
           currentTurn: payload.currentTurn,
           passCount: payload.passCount || 0,
         }));
-        setMessage(`${opponentName || "Oponente"} jogou uma peça`);
+        setMessage(`Oponente jogou uma peça`);
         if (payload.finished) {
           setResult(payload.result);
           setStatus("finished");
@@ -159,7 +160,7 @@ export default function DominoGame() {
           currentTurn: payload.currentTurn,
           passCount: payload.passCount || 0,
         }));
-        setMessage(`${opponentName || "Oponente"} comprou uma peça`);
+        setMessage(`Oponente comprou uma peça`);
       })
       .on("broadcast", { event: "pass" }, ({ payload }) => {
         setGs(prev => ({
@@ -167,7 +168,7 @@ export default function DominoGame() {
           currentTurn: payload.currentTurn,
           passCount: payload.passCount,
         }));
-        setMessage(`${opponentName || "Oponente"} passou`);
+        setMessage(`Oponente passou`);
         if (payload.finished) {
           setResult(payload.result);
           setStatus("finished");
@@ -179,12 +180,22 @@ export default function DominoGame() {
           startGame(gsRef.current.scores);
         }
       })
-      .subscribe(async () => {
-        await channel.track({ name: myName, role });
+      .subscribe(() => {
+        sendHello();
+        heartbeatInterval = setInterval(() => {
+          if (statusRef.current === "waiting") {
+            sendHello();
+          } else {
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
+          }
+        }, 2000);
       });
 
-    return () => { supabase.removeChannel(channel); };
-  }, [roomId, role, myName, nameConfirmed, startGame]);
+    return () => {
+      if (heartbeatInterval) clearInterval(heartbeatInterval);
+      supabase.removeChannel(channel);
+    };
+  }, [roomId, role, nameConfirmed, startGame]);
 
   const isMyTurn = gs.currentTurn === role && status === "playing";
   const playable = isMyTurn ? getPlayableIndices(gs.myHand, gs.leftEnd, gs.rightEnd) : [];
@@ -247,43 +258,25 @@ export default function DominoGame() {
     const newPile = gs.pile.slice(1);
     const newHand = [...gs.myHand, drawn];
     const nextTurn = role === "host" ? "guest" : "host";
-
     const newPlayable = getPlayableIndices(newHand, gs.leftEnd, gs.rightEnd);
     const keepTurn = newPlayable.length > 0;
     const turn = keepTurn ? role : nextTurn;
 
     setGs(prev => ({ ...prev, myHand: newHand, pile: newPile, currentTurn: turn }));
     setMessage(keepTurn ? "Você comprou uma peça" : "Você comprou e passou");
-    broadcast("draw", {
-      pile: newPile,
-      oppHandCount: newHand.length,
-      currentTurn: turn,
-      passCount: 0,
-    });
+    broadcast("draw", { pile: newPile, oppHandCount: newHand.length, currentTurn: turn, passCount: 0 });
   }
 
   function handlePass() {
     if (!canPass) return;
     const nextTurn = role === "host" ? "guest" : "host";
     const newPassCount = gs.passCount + 1;
-
-    let finished = false;
-    let resultMsg = "";
     const newScores = { ...gs.scores };
-
-    if (newPassCount >= 2) {
-      finished = true;
-      resultMsg = "Jogo bloqueado! Ninguém pode jogar.";
-    }
+    const finished = newPassCount >= 2;
+    const resultMsg = finished ? "Jogo bloqueado! Ninguém pode jogar." : "";
 
     setGs(prev => ({ ...prev, currentTurn: nextTurn, passCount: newPassCount, scores: newScores }));
-    broadcast("pass", {
-      currentTurn: nextTurn,
-      passCount: newPassCount,
-      finished,
-      result: resultMsg,
-      scores: newScores,
-    });
+    broadcast("pass", { currentTurn: nextTurn, passCount: newPassCount, finished, result: resultMsg, scores: newScores });
 
     if (finished) {
       setResult("Jogo bloqueado!");
@@ -302,7 +295,6 @@ export default function DominoGame() {
     }
   }
 
-  // Name entry screen
   if (!nameConfirmed) {
     return (
       <main className="min-h-screen flex flex-col items-center justify-center p-6" style={{ background: '#0f172a' }}>
@@ -315,13 +307,23 @@ export default function DominoGame() {
             placeholder="Seu nome..."
             value={nameInput}
             onChange={e => setNameInput(e.target.value)}
-            onKeyDown={e => { if (e.key === "Enter" && nameInput.trim()) { setMyName(nameInput.trim()); setNameConfirmed(true); } }}
+            onKeyDown={e => {
+              if (e.key === "Enter" && nameInput.trim()) {
+                setMyName(nameInput.trim());
+                setNameConfirmed(true);
+              }
+            }}
             className="w-full px-4 py-3 rounded-xl text-center text-lg font-semibold outline-none border-2 mb-4"
             style={{ background: '#1e293b', color: '#f1f5f9', borderColor: '#334155' }}
             autoFocus
           />
           <button
-            onClick={() => { if (nameInput.trim()) { setMyName(nameInput.trim()); setNameConfirmed(true); } }}
+            onClick={() => {
+              if (nameInput.trim()) {
+                setMyName(nameInput.trim());
+                setNameConfirmed(true);
+              }
+            }}
             disabled={!nameInput.trim()}
             className="w-full py-3 rounded-xl font-bold disabled:opacity-40"
             style={{ background: '#4f46e5', color: 'white' }}
@@ -336,27 +338,23 @@ export default function DominoGame() {
   return (
     <main className="min-h-screen flex flex-col" style={{ background: '#0f172a', color: '#f1f5f9' }}>
       <div className="flex flex-col h-screen max-w-2xl mx-auto w-full p-3">
-        {/* Header */}
         <div className="flex items-center justify-between mb-3">
           <div>
             <h1 className="text-xl font-bold">⬛ Dominó</h1>
             <div className="text-xs font-mono" style={{ color: '#64748b' }}>Sala: {roomId}</div>
           </div>
-          <div className="text-right">
-            <div className="text-sm" style={{ color: '#94a3b8' }}>
-              {myName} <span style={{ color: '#6366f1' }}>{gs.scores[role]}</span>
-              {" "}<span style={{ color: '#475569' }}>-</span>{" "}
-              <span style={{ color: '#6366f1' }}>{gs.scores[role === "host" ? "guest" : "host"]}</span> {opponentName || "..."}
-            </div>
+          <div className="text-right text-sm" style={{ color: '#94a3b8' }}>
+            {myName} <span style={{ color: '#6366f1' }}>{gs.scores[role]}</span>
+            {" "}<span style={{ color: '#475569' }}>-</span>{" "}
+            <span style={{ color: '#6366f1' }}>{gs.scores[role === "host" ? "guest" : "host"]}</span> {opponentName || "..."}
           </div>
         </div>
 
-        {/* Waiting */}
         {status === "waiting" && (
           <div className="flex-1 flex flex-col items-center justify-center">
             <div className="p-6 rounded-xl text-center" style={{ background: '#1e293b' }}>
               <p className="mb-3" style={{ color: '#94a3b8' }}>
-                {role === "host" ? "Aguardando oponente..." : "Conectando..."}
+                {role === "host" ? "⏳ Aguardando oponente..." : "⏳ Conectando..."}
               </p>
               {role === "host" && (
                 <>
@@ -378,7 +376,6 @@ export default function DominoGame() {
 
         {status !== "waiting" && (
           <>
-            {/* Opponent info */}
             <div className="flex items-center justify-between mb-2 px-3 py-2 rounded-lg" style={{ background: '#1e293b' }}>
               <span className="text-sm" style={{ color: '#94a3b8' }}>
                 {opponentName || "Oponente"}: {gs.oppHandCount} peças
@@ -389,7 +386,6 @@ export default function DominoGame() {
               )}
             </div>
 
-            {/* Board */}
             <div className="flex-1 overflow-x-auto flex items-center rounded-xl mb-3" style={{ background: '#1e293b', minHeight: '120px' }}>
               {gs.board.length === 0 ? (
                 <div className="w-full text-center" style={{ color: '#475569' }}>
@@ -433,12 +429,10 @@ export default function DominoGame() {
               )}
             </div>
 
-            {/* Message */}
             {message && (
               <div className="text-center text-sm mb-2" style={{ color: '#94a3b8' }}>{message}</div>
             )}
 
-            {/* Turn indicator */}
             <div className="text-center mb-2">
               <span className="px-3 py-1 rounded-lg text-sm font-semibold" style={{
                 background: isMyTurn ? '#14532d' : '#1e293b',
@@ -448,40 +442,26 @@ export default function DominoGame() {
               </span>
             </div>
 
-            {/* Action buttons */}
             {isMyTurn && (
               <div className="flex gap-2 mb-3 justify-center">
                 {canDraw && (
-                  <button
-                    onClick={handleDraw}
-                    className="px-4 py-2 rounded-lg font-semibold text-sm"
-                    style={{ background: '#0e7490', color: 'white' }}
-                  >
+                  <button onClick={handleDraw} className="px-4 py-2 rounded-lg font-semibold text-sm" style={{ background: '#0e7490', color: 'white' }}>
                     🃏 Comprar ({gs.pile.length})
                   </button>
                 )}
                 {canPass && (
-                  <button
-                    onClick={handlePass}
-                    className="px-4 py-2 rounded-lg font-semibold text-sm"
-                    style={{ background: '#92400e', color: 'white' }}
-                  >
+                  <button onClick={handlePass} className="px-4 py-2 rounded-lg font-semibold text-sm" style={{ background: '#92400e', color: 'white' }}>
                     ⏭ Passar
                   </button>
                 )}
                 {selected !== null && gs.board.length === 0 && (
-                  <button
-                    onClick={() => handlePlay(selected, "right")}
-                    className="px-4 py-2 rounded-lg font-semibold text-sm"
-                    style={{ background: '#15803d', color: 'white' }}
-                  >
+                  <button onClick={() => handlePlay(selected, "right")} className="px-4 py-2 rounded-lg font-semibold text-sm" style={{ background: '#15803d', color: 'white' }}>
                     ▶ Jogar
                   </button>
                 )}
               </div>
             )}
 
-            {/* My hand */}
             <div className="overflow-x-auto pb-2">
               <div className="flex gap-2 min-w-max px-1">
                 {gs.myHand.map((piece, i) => {
@@ -492,23 +472,16 @@ export default function DominoGame() {
                       key={i}
                       onClick={() => {
                         if (!isMyTurn || !isPlayable) return;
-                        if (isSelected) {
-                          setSelected(null);
-                          return;
-                        }
+                        if (isSelected) { setSelected(null); return; }
                         if (gs.board.length === 0) {
                           setSelected(i);
                         } else {
                           const [a, b] = piece;
                           const canLeft = a === gs.leftEnd || b === gs.leftEnd;
                           const canRight = a === gs.rightEnd || b === gs.rightEnd;
-                          if (canLeft && !canRight) {
-                            handlePlay(i, "left");
-                          } else if (!canLeft && canRight) {
-                            handlePlay(i, "right");
-                          } else {
-                            setSelected(i);
-                          }
+                          if (canLeft && !canRight) handlePlay(i, "left");
+                          else if (!canLeft && canRight) handlePlay(i, "right");
+                          else setSelected(i);
                         }
                       }}
                       className="transition-all"
@@ -527,24 +500,15 @@ export default function DominoGame() {
           </>
         )}
 
-        {/* Finished */}
         {status === "finished" && result && (
           <div className="fixed inset-0 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.7)' }}>
             <div className="p-8 rounded-2xl text-center" style={{ background: '#1e293b' }}>
               <p className="text-3xl font-bold mb-4">{result}</p>
               <div className="flex gap-3 justify-center">
-                <button
-                  onClick={handleReset}
-                  className="px-6 py-3 rounded-xl font-bold"
-                  style={{ background: '#4f46e5', color: 'white' }}
-                >
+                <button onClick={handleReset} className="px-6 py-3 rounded-xl font-bold" style={{ background: '#4f46e5', color: 'white' }}>
                   {role === "host" ? "Nova Partida" : "Pedir Revanche"}
                 </button>
-                <button
-                  onClick={() => router.push("/")}
-                  className="px-6 py-3 rounded-xl font-bold"
-                  style={{ background: '#334155', color: 'white' }}
-                >
+                <button onClick={() => router.push("/")} className="px-6 py-3 rounded-xl font-bold" style={{ background: '#334155', color: 'white' }}>
                   Menu
                 </button>
               </div>
@@ -552,11 +516,7 @@ export default function DominoGame() {
           </div>
         )}
 
-        <button
-          onClick={() => router.push("/")}
-          className="mt-2 text-center text-xs underline"
-          style={{ color: '#475569' }}
-        >
+        <button onClick={() => router.push("/")} className="mt-2 text-center text-xs underline" style={{ color: '#475569' }}>
           ← Sair
         </button>
       </div>
@@ -564,23 +524,12 @@ export default function DominoGame() {
   );
 }
 
-function DominoPiece({ a, b, small, highlighted }: {
-  a: number; b: number; small?: boolean; highlighted?: boolean;
-}) {
+function DominoPiece({ a, b, small, highlighted }: { a: number; b: number; small?: boolean; highlighted?: boolean }) {
   const size = small ? 36 : 48;
   const dotSize = small ? 5 : 7;
   const gap = small ? 'gap-0.5' : 'gap-1';
-
   return (
-    <div
-      className={`flex flex-col items-center rounded border-2 ${gap}`}
-      style={{
-        background: highlighted ? '#312e81' : '#f8fafc',
-        borderColor: highlighted ? '#818cf8' : '#94a3b8',
-        padding: small ? '2px' : '4px',
-        width: size,
-      }}
-    >
+    <div className={`flex flex-col items-center rounded border-2 ${gap}`} style={{ background: highlighted ? '#312e81' : '#f8fafc', borderColor: highlighted ? '#818cf8' : '#94a3b8', padding: small ? '2px' : '4px', width: size }}>
       <DiceFace value={a} size={size} dotSize={dotSize} />
       <div style={{ height: 1, background: '#94a3b8', width: '100%' }} />
       <DiceFace value={b} size={size} dotSize={dotSize} />
@@ -603,17 +552,7 @@ function DiceFace({ value, size, dotSize }: { value: number; size: number; dotSi
   return (
     <div className="relative" style={{ width: size - 8, height: size - 8 }}>
       {positions.map(([cx, cy], i) => (
-        <div
-          key={i}
-          className="absolute rounded-full"
-          style={{
-            width: dotSize,
-            height: dotSize,
-            background: '#1e293b',
-            left: `calc(${cx}% - ${dotSize / 2}px)`,
-            top: `calc(${cy}% - ${dotSize / 2}px)`,
-          }}
-        />
+        <div key={i} className="absolute rounded-full" style={{ width: dotSize, height: dotSize, background: '#1e293b', left: `calc(${cx}% - ${dotSize / 2}px)`, top: `calc(${cy}% - ${dotSize / 2}px)` }} />
       ))}
     </div>
   );
