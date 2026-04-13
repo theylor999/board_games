@@ -24,8 +24,12 @@ export default function DominoGame() {
   const { roomId } = useParams<{ roomId: string }>();
   const searchParams = useSearchParams();
   const router = useRouter();
-  const name = searchParams.get("name") || "Jogador";
   const role = searchParams.get("role") as "host" | "guest";
+
+  // Name entry state
+  const [myName, setMyName] = useState(searchParams.get("name") || "");
+  const [nameConfirmed, setNameConfirmed] = useState(!!searchParams.get("name"));
+  const [nameInput, setNameInput] = useState("");
 
   const [status, setStatus] = useState<"waiting" | "playing" | "finished">("waiting");
   const [opponentName, setOpponentName] = useState<string | null>(null);
@@ -38,17 +42,21 @@ export default function DominoGame() {
   const [selected, setSelected] = useState<number | null>(null);
   const [message, setMessage] = useState<string>("");
   const channelRef = useRef<RealtimeChannel | null>(null);
+  const statusRef = useRef(status);
+  statusRef.current = status;
+  const gsRef = useRef(gs);
+  gsRef.current = gs;
 
   const shareUrl = typeof window !== "undefined"
-    ? `${window.location.origin}/domino/${roomId}?name=SeuNome&role=guest`
+    ? `${window.location.origin}/domino/${roomId}?role=guest`
     : "";
 
   const broadcast = useCallback((event: string, payload: Record<string, unknown>) => {
     channelRef.current?.send({ type: "broadcast", event, payload });
   }, []);
 
-  // Host starts the game
-  function startGame(existingScores?: { host: number; guest: number }) {
+  // Host starts the game — only called once when guest presence detected
+  const startGame = useCallback((existingScores?: { host: number; guest: number }) => {
     const deck = createDeck();
     const { hand1, hand2, pile } = dealHands(deck);
     const scores = existingScores || { host: 0, guest: 0 };
@@ -69,30 +77,45 @@ export default function DominoGame() {
     setSelected(null);
     setMessage("");
 
-    // Send guest their hand
-    broadcast("game_start", {
-      guestHand: hand2,
-      hostHandCount: hand1.length,
-      pile,
-      scores,
+    channelRef.current?.send({
+      type: "broadcast",
+      event: "game_start",
+      payload: {
+        guestHand: hand2,
+        hostHandCount: hand1.length,
+        pile,
+        scores,
+      },
     });
-  }
+  }, []);
 
   useEffect(() => {
+    if (!nameConfirmed) return;
+
     const channel = supabase.channel(`domino:${roomId}`, {
-      config: { broadcast: { self: false } },
+      config: {
+        broadcast: { self: false },
+        presence: { key: role },
+      },
     });
     channelRef.current = channel;
 
+    // Presence: detect when opponent joins
+    channel.on("presence", { event: "sync" }, () => {
+      const state = channel.presenceState<{ name: string; role: string }>();
+      const users = Object.values(state).flat();
+      const opponent = users.find(u => u.role !== role);
+      if (opponent) {
+        setOpponentName(opponent.name);
+        if (statusRef.current === "waiting" && role === "host") {
+          startGame();
+        } else if (statusRef.current === "waiting" && role === "guest") {
+          setStatus("playing");
+        }
+      }
+    });
+
     channel
-      .on("broadcast", { event: "join" }, ({ payload }) => {
-        setOpponentName(payload.name);
-        setStatus("playing");
-        startGame();
-      })
-      .on("broadcast", { event: "opponent_name" }, ({ payload }) => {
-        setOpponentName(payload.name);
-      })
       .on("broadcast", { event: "game_start" }, ({ payload }) => {
         setGs(prev => ({
           ...prev,
@@ -112,7 +135,6 @@ export default function DominoGame() {
         setMessage("");
       })
       .on("broadcast", { event: "move" }, ({ payload }) => {
-        // Opponent played a piece
         setGs(prev => ({
           ...prev,
           board: payload.board,
@@ -130,7 +152,6 @@ export default function DominoGame() {
         }
       })
       .on("broadcast", { event: "draw" }, ({ payload }) => {
-        // Opponent drew from pile
         setGs(prev => ({
           ...prev,
           pile: payload.pile,
@@ -155,20 +176,15 @@ export default function DominoGame() {
       })
       .on("broadcast", { event: "request_reset" }, () => {
         if (role === "host") {
-          startGame(gs.scores);
+          startGame(gsRef.current.scores);
         }
       })
-      .subscribe(() => {
-        if (role === "guest") {
-          channel.send({ type: "broadcast", event: "join", payload: { name } });
-        } else {
-          channel.send({ type: "broadcast", event: "opponent_name", payload: { name } });
-        }
+      .subscribe(async () => {
+        await channel.track({ name: myName, role });
       });
 
     return () => { supabase.removeChannel(channel); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, role, name]);
+  }, [roomId, role, myName, nameConfirmed, startGame]);
 
   const isMyTurn = gs.currentTurn === role && status === "playing";
   const playable = isMyTurn ? getPlayableIndices(gs.myHand, gs.leftEnd, gs.rightEnd) : [];
@@ -185,12 +201,12 @@ export default function DominoGame() {
     const nextTurn = role === "host" ? "guest" : "host";
 
     let finished = false;
-    let result = "";
-    let newScores = { ...gs.scores };
+    let resultMsg = "";
+    const newScores = { ...gs.scores };
 
     if (newHand.length === 0) {
       finished = true;
-      result = "Você venceu! Bateu as peças! 🎉";
+      resultMsg = `${myName} venceu!`;
       newScores[role] += 1;
     }
 
@@ -214,7 +230,7 @@ export default function DominoGame() {
       oppHandCount: newHand.length,
       currentTurn: nextTurn,
       finished,
-      result: finished ? (role === "host" ? `${name} venceu!` : `${name} venceu!`) : "",
+      result: resultMsg,
       scores: newScores,
       passCount: 0,
     });
@@ -233,26 +249,17 @@ export default function DominoGame() {
     const nextTurn = role === "host" ? "guest" : "host";
 
     const newPlayable = getPlayableIndices(newHand, gs.leftEnd, gs.rightEnd);
-    if (newPlayable.length > 0) {
-      // Drew and can play — keep turn
-      setGs(prev => ({ ...prev, myHand: newHand, pile: newPile }));
-      setMessage("Você comprou uma peça");
-      broadcast("draw", {
-        pile: newPile,
-        oppHandCount: newHand.length,
-        currentTurn: role,
-        passCount: 0,
-      });
-    } else {
-      setGs(prev => ({ ...prev, myHand: newHand, pile: newPile, currentTurn: nextTurn }));
-      setMessage("Você comprou uma peça e passou");
-      broadcast("draw", {
-        pile: newPile,
-        oppHandCount: newHand.length,
-        currentTurn: nextTurn,
-        passCount: 0,
-      });
-    }
+    const keepTurn = newPlayable.length > 0;
+    const turn = keepTurn ? role : nextTurn;
+
+    setGs(prev => ({ ...prev, myHand: newHand, pile: newPile, currentTurn: turn }));
+    setMessage(keepTurn ? "Você comprou uma peça" : "Você comprou e passou");
+    broadcast("draw", {
+      pile: newPile,
+      oppHandCount: newHand.length,
+      currentTurn: turn,
+      passCount: 0,
+    });
   }
 
   function handlePass() {
@@ -261,17 +268,12 @@ export default function DominoGame() {
     const newPassCount = gs.passCount + 1;
 
     let finished = false;
-    let result = "";
-    let newScores = { ...gs.scores };
+    let resultMsg = "";
+    const newScores = { ...gs.scores };
 
     if (newPassCount >= 2) {
-      // Both passed — game over, count pips
       finished = true;
-      const myPips = countPips(gs.myHand);
-      // We don't have opp hand locally, so just declare blocked
-      result = "Jogo bloqueado! Contando pontos...";
-      // Whoever has fewer pips wins — but we can only know our own
-      // We'll just say "game blocked"
+      resultMsg = "Jogo bloqueado! Ninguém pode jogar.";
     }
 
     setGs(prev => ({ ...prev, currentTurn: nextTurn, passCount: newPassCount, scores: newScores }));
@@ -279,12 +281,12 @@ export default function DominoGame() {
       currentTurn: nextTurn,
       passCount: newPassCount,
       finished,
-      result,
+      result: resultMsg,
       scores: newScores,
     });
 
     if (finished) {
-      setResult("Jogo bloqueado! Ninguém pode jogar.");
+      setResult("Jogo bloqueado!");
       setStatus("finished");
     } else {
       setMessage("Você passou");
@@ -300,6 +302,37 @@ export default function DominoGame() {
     }
   }
 
+  // Name entry screen
+  if (!nameConfirmed) {
+    return (
+      <main className="min-h-screen flex flex-col items-center justify-center p-6" style={{ background: '#0f172a' }}>
+        <div className="max-w-sm w-full text-center">
+          <h1 className="text-3xl font-bold mb-2" style={{ color: '#f1f5f9' }}>⬛ Dominó</h1>
+          <p className="mb-6" style={{ color: '#94a3b8' }}>Sala: <span className="font-mono font-bold" style={{ color: '#6366f1' }}>{roomId}</span></p>
+          <p className="mb-4" style={{ color: '#94a3b8' }}>Digite seu nome para entrar:</p>
+          <input
+            type="text"
+            placeholder="Seu nome..."
+            value={nameInput}
+            onChange={e => setNameInput(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && nameInput.trim()) { setMyName(nameInput.trim()); setNameConfirmed(true); } }}
+            className="w-full px-4 py-3 rounded-xl text-center text-lg font-semibold outline-none border-2 mb-4"
+            style={{ background: '#1e293b', color: '#f1f5f9', borderColor: '#334155' }}
+            autoFocus
+          />
+          <button
+            onClick={() => { if (nameInput.trim()) { setMyName(nameInput.trim()); setNameConfirmed(true); } }}
+            disabled={!nameInput.trim()}
+            className="w-full py-3 rounded-xl font-bold disabled:opacity-40"
+            style={{ background: '#4f46e5', color: 'white' }}
+          >
+            Entrar na Sala
+          </button>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="min-h-screen flex flex-col" style={{ background: '#0f172a', color: '#f1f5f9' }}>
       <div className="flex flex-col h-screen max-w-2xl mx-auto w-full p-3">
@@ -311,7 +344,7 @@ export default function DominoGame() {
           </div>
           <div className="text-right">
             <div className="text-sm" style={{ color: '#94a3b8' }}>
-              {name} <span style={{ color: '#6366f1' }}>{gs.scores[role]}</span>
+              {myName} <span style={{ color: '#6366f1' }}>{gs.scores[role]}</span>
               {" "}<span style={{ color: '#475569' }}>-</span>{" "}
               <span style={{ color: '#6366f1' }}>{gs.scores[role === "host" ? "guest" : "host"]}</span> {opponentName || "..."}
             </div>
@@ -322,17 +355,23 @@ export default function DominoGame() {
         {status === "waiting" && (
           <div className="flex-1 flex flex-col items-center justify-center">
             <div className="p-6 rounded-xl text-center" style={{ background: '#1e293b' }}>
-              <p className="mb-3" style={{ color: '#94a3b8' }}>Aguardando oponente...</p>
-              <div className="text-xs font-mono p-2 rounded break-all mb-3" style={{ background: '#0f172a', color: '#6366f1' }}>
-                {shareUrl}
-              </div>
-              <button
-                onClick={() => navigator.clipboard.writeText(shareUrl)}
-                className="text-xs px-3 py-2 rounded-lg font-semibold"
-                style={{ background: '#4f46e5', color: 'white' }}
-              >
-                📋 Copiar Link
-              </button>
+              <p className="mb-3" style={{ color: '#94a3b8' }}>
+                {role === "host" ? "Aguardando oponente..." : "Conectando..."}
+              </p>
+              {role === "host" && (
+                <>
+                  <div className="text-xs font-mono p-2 rounded break-all mb-3" style={{ background: '#0f172a', color: '#6366f1' }}>
+                    {shareUrl}
+                  </div>
+                  <button
+                    onClick={() => navigator.clipboard.writeText(shareUrl)}
+                    className="text-xs px-3 py-2 rounded-lg font-semibold"
+                    style={{ background: '#4f46e5', color: 'white' }}
+                  >
+                    📋 Copiar Link
+                  </button>
+                </>
+              )}
             </div>
           </div>
         )}
@@ -455,23 +494,20 @@ export default function DominoGame() {
                         if (!isMyTurn || !isPlayable) return;
                         if (isSelected) {
                           setSelected(null);
-                        } else {
+                          return;
+                        }
+                        if (gs.board.length === 0) {
                           setSelected(i);
-                          // If board is empty, play immediately
-                          if (gs.board.length === 0) {
+                        } else {
+                          const [a, b] = piece;
+                          const canLeft = a === gs.leftEnd || b === gs.leftEnd;
+                          const canRight = a === gs.rightEnd || b === gs.rightEnd;
+                          if (canLeft && !canRight) {
+                            handlePlay(i, "left");
+                          } else if (!canLeft && canRight) {
+                            handlePlay(i, "right");
+                          } else {
                             setSelected(i);
-                          } else if (gs.board.length > 0) {
-                            // Check if only one side possible
-                            const [a, b] = piece;
-                            const canLeft = a === gs.leftEnd || b === gs.leftEnd;
-                            const canRight = a === gs.rightEnd || b === gs.rightEnd;
-                            if (canLeft && !canRight) {
-                              handlePlay(i, "left");
-                            } else if (!canLeft && canRight) {
-                              handlePlay(i, "right");
-                            } else {
-                              setSelected(i);
-                            }
                           }
                         }
                       }}
